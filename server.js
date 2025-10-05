@@ -1,11 +1,14 @@
 // server.js
-// Relay + static site + webhook → SSE + proxy to /twoleg and /hangup (recording stripped on /twoleg)
+// Relay + static site + webhook → SSE + proxy to /twoleg, /hangup, and /recording (token auto-attached)
 
 require('dotenv').config(); // load .env (npm i dotenv)
 
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const { Readable, pipeline } = require('stream');
+const { promisify } = require('util');
+const pipe = promisify(pipeline);
 
 const PORT = process.env.PORT || 9000;
 const API_BASE = (process.env.API_BASE || 'http://35.239.188.72:8080').replace(/\/+$/, '');
@@ -13,7 +16,7 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || null; // <— attaches to proxied calls if set
 
 // debug logging (enable with DEBUG=1)
-const DBG = process.env.DEBUG === "1";
+const DBG = process.env.DEBUG === '1';
 const log  = (...args) => { if (DBG) console.log(...args); };
 const loge = (...args) => { if (DBG) console.error(...args); };
 
@@ -37,10 +40,11 @@ function addEvent(callId, evt) {
   const subs = subscribers[key];
   if (subs && subs.size) {
     const payload = `event: update\ndata: ${JSON.stringify(evt)}\n\n`;
-    for (const res of subs) { try { res.write(payload); } catch {} }
+    for (const res of subs) { try { res.write(payload); } catch {/* ignore */} }
   }
 }
 
+// serve the static SPA from /public
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/health', (_req, res) => res.json({ ok: true, api_base: API_BASE }));
@@ -81,10 +85,9 @@ app.get('/events', (req, res) => {
 app.post('/api/twoleg', async (req, res) => {
   try {
     const cleanBody = { ...req.body };
-    if ('record' in cleanBody) delete cleanBody.record;
+    if ('record' in cleanBody) delete cleanBody.record; // not forwarded upstream
 
-    // auto-attach token if configured
-    if (AUTH_TOKEN) cleanBody.auth_token = AUTH_TOKEN;
+    if (AUTH_TOKEN) cleanBody.auth_token = AUTH_TOKEN; // auto-attach token
 
     const upstream = await fetch(`${API_BASE}/twoleg`, {
       method: 'POST',
@@ -101,7 +104,7 @@ app.post('/api/twoleg', async (req, res) => {
       res.status(upstream.status).send(text);
     }
   } catch (err) {
-    loge("Proxy error (twoleg):", err.message);
+    loge('Proxy error (twoleg):', err.message);
     res.status(502).json({ error: 'bad_gateway', detail: String(err?.message || err) });
   }
 });
@@ -109,13 +112,10 @@ app.post('/api/twoleg', async (req, res) => {
 // Proxy: browser → /api/hangup → API_BASE/hangup (auto-attach AUTH_TOKEN)
 app.post('/api/hangup', async (req, res) => {
   try {
-    const body = {
-      call_id: req.body?.call_id,
-    };
+    const body = { call_id: req.body?.call_id };
     if (!body.call_id) return res.status(400).json({ error: 'Missing call_id' });
 
-    // auto-attach token if configured
-    if (AUTH_TOKEN) body.auth_token = AUTH_TOKEN;
+    if (AUTH_TOKEN) body.auth_token = AUTH_TOKEN; // auto-attach token
 
     const upstream = await fetch(`${API_BASE}/hangup`, {
       method: 'POST',
@@ -132,7 +132,54 @@ app.post('/api/hangup', async (req, res) => {
       res.status(upstream.status).send(text);
     }
   } catch (err) {
-    loge("Proxy error (hangup):", err.message);
+    loge('Proxy error (hangup):', err.message);
+    res.status(502).json({ error: 'bad_gateway', detail: String(err?.message || err) });
+  }
+});
+
+// Proxy: browser → /api/recording → API_BASE/recording (auto-attach AUTH_TOKEN)
+// Fixed for Node 22: convert WHATWG ReadableStream to Node stream before piping
+app.get('/api/recording', async (req, res) => {
+  try {
+    const { date, filename } = req.query;
+    if (!date || !filename) {
+      return res.status(400).json({ error: 'Missing date or filename' });
+    }
+
+    const params = new URLSearchParams({ date, filename });
+    if (AUTH_TOKEN) params.set('auth_token', AUTH_TOKEN);
+
+    const url = `${API_BASE}/recording?${params.toString()}`;
+    log('GET upstream recording:', url);
+
+    const upstream = await fetch(url);
+
+    // propagate status + headers
+    res.status(upstream.status);
+
+    const ct = upstream.headers.get('content-type') || 'audio/wav';
+    res.set('Content-Type', ct);
+
+    const cd = upstream.headers.get('content-disposition') || `attachment; filename="${filename}"`;
+    res.set('Content-Disposition', cd);
+
+    const cl = upstream.headers.get('content-length');
+    if (cl) res.set('Content-Length', cl);
+
+    if (!upstream.ok) {
+      const errorText = await upstream.text().catch(() => '');
+      return res.end(errorText);
+    }
+
+    // Bridge Web ReadableStream -> Node stream
+    const nodeStream = Readable.fromWeb(upstream.body);
+    await pipe(nodeStream, res);
+  } catch (err) {
+    loge('Proxy error (recording):', err?.stack || err?.message || String(err));
+    if (res.headersSent) {
+      try { res.destroy(); } catch {}
+      return;
+    }
     res.status(502).json({ error: 'bad_gateway', detail: String(err?.message || err) });
   }
 });
@@ -140,8 +187,9 @@ app.post('/api/hangup', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Relay listening on http://0.0.0.0:${PORT}`);
   console.log(`Serving static from ${path.join(__dirname, 'public')}`);
-  console.log(`Webhook: POST /webhook   SSE: GET /events?call_id=...`);
-  console.log(`Proxy: POST /api/twoleg  → ${API_BASE}/twoleg (auth auto-attached${AUTH_TOKEN?' ✅':' ❌'})`);
-  console.log(`Proxy: POST /api/hangup  → ${API_BASE}/hangup (auth auto-attached${AUTH_TOKEN?' ✅':' ❌'})`);
+  console.log('Webhook: POST /webhook   SSE: GET /events?call_id=...');
+  console.log(`Proxy: POST /api/twoleg   → ${API_BASE}/twoleg (auth auto-attached${AUTH_TOKEN ? ' ✅' : ' ❌'})`);
+  console.log(`Proxy: POST /api/hangup   → ${API_BASE}/hangup (auth auto-attached${AUTH_TOKEN ? ' ✅' : ' ❌'})`);
+  console.log(`Proxy:  GET /api/recording → ${API_BASE}/recording (auth auto-attached${AUTH_TOKEN ? ' ✅' : ' ❌'})`);
 });
 
