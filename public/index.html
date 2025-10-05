@@ -98,13 +98,13 @@
       <div class="card">
         <form id="f" style="display:flex;flex-direction:column;min-height:0">
           <div>
-            <label>A‑leg extension:</label>
+            <label>A-leg extension:</label>
             <input id="aExt" required placeholder="1000">
 
-            <label>B‑leg number:</label>
+            <label>B-leg number:</label>
             <input id="bNum" required placeholder="0771234567 or +947...">
 
-            <label>A‑leg tech:</label>
+            <label>A-leg tech:</label>
             <select id="tech">
               <option value="SIP">SIP</option>
               <option value="PJSIP">PJSIP</option>
@@ -134,7 +134,14 @@
           <pre id="status">—</pre>
         </div>
         <div class="card">
-          <div class="panel-title">Details</div>
+          <div class="panel-title">
+            Details
+            <!-- Added: download button (hidden until a recording URL is available) -->
+            <button id="btnDownload"
+              style="float:right;background:#10b981;color:#fff;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;display:none">
+              ⬇ Download
+            </button>
+          </div>
           <pre id="details">—</pre>
         </div>
       </div>
@@ -148,6 +155,7 @@
     const cbUrlPreview = document.getElementById('cbUrlPreview');
     const btnHangup = document.getElementById('btnHangup');
     const btnInit = document.getElementById('btnInit');
+    const btnDownload = document.getElementById('btnDownload'); // <-- new
 
     const CALLBACK_URL = `${window.location.origin}/webhook`;
     cbUrlPreview.textContent = CALLBACK_URL;
@@ -196,6 +204,12 @@
         if (t === 'call_details') {
           const a = p.a_leg || {}, b = p.b_leg || {};
           const r = p.recording || null;
+
+          // build proxy download URL if recording exists
+          const recUrl = r
+            ? `/api/recording?date=${encodeURIComponent(r.date_folder)}&filename=${encodeURIComponent(r.filename)}`
+            : null;
+
           const d = {
             call_id: p.call_id,
             a_ext: p.a_ext,
@@ -215,11 +229,24 @@
               talk_seconds: b.talk_seconds,
               hangup_cause: b.hangup_cause ?? null
             },
-            recording: r ? { filename: r.filename, date_folder: r.date_folder } : null
+            recording: r ? {
+              filename: r.filename,
+              date_folder: r.date_folder,
+              download_url: recUrl
+            } : null
           };
           detailsEl.textContent = JSON.stringify(d, null, 2);
           detailsEl.scrollTop = 0;
           log('completed');
+
+          // show/hide the button, wire click to open the URL
+          if (recUrl) {
+            btnDownload.style.display = 'inline-block';
+            btnDownload.onclick = () => window.open(recUrl, '_blank');
+          } else {
+            btnDownload.style.display = 'none';
+            btnDownload.onclick = null;
+          }
         }
       });
     }
